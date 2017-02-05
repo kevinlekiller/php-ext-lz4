@@ -27,6 +27,7 @@
 
 #include "php.h"
 #include "php_ini.h"
+#include <ext/standard/file.h>
 #include "ext/standard/info.h"
 #include "php_verdep.h"
 #include "php_lz4.h"
@@ -62,9 +63,18 @@
 #endif
 
 static ZEND_FUNCTION(lz4_compress);
+static ZEND_FUNCTION(lz4_compress_to_file);
 static ZEND_FUNCTION(lz4_uncompress);
+static ZEND_FUNCTION(lz4_uncompress_from_file);
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_lz4_compress, 0, 0, 1)
+    ZEND_ARG_INFO(0, data)
+    ZEND_ARG_INFO(0, level)
+    ZEND_ARG_INFO(0, extra)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_lz4_compress_to_file, 0, 0, 2)
+    ZEND_ARG_INFO(0, path)
     ZEND_ARG_INFO(0, data)
     ZEND_ARG_INFO(0, level)
     ZEND_ARG_INFO(0, extra)
@@ -76,9 +86,17 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_lz4_uncompress, 0, 0, 1)
     ZEND_ARG_INFO(0, offset)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_lz4_uncompress_from_file, 0, 0, 1)
+    ZEND_ARG_INFO(0, path)
+    ZEND_ARG_INFO(0, max)
+    ZEND_ARG_INFO(0, offset)
+ZEND_END_ARG_INFO()
+
 static zend_function_entry lz4_functions[] = {
     ZEND_FE(lz4_compress, arginfo_lz4_compress)
+    ZEND_FE(lz4_compress_to_file, arginfo_lz4_compress_to_file)
     ZEND_FE(lz4_uncompress, arginfo_lz4_uncompress)
+    ZEND_FE(lz4_uncompress_from_file, arginfo_lz4_uncompress_from_file)
     ZEND_FE_END
 };
 
@@ -216,6 +234,93 @@ static ZEND_FUNCTION(lz4_compress)
     efree(output);
 }
 
+static ZEND_FUNCTION(lz4_compress_to_file)
+{
+    zval *path;
+    zval *data;
+    php_stream *stream;
+    char *output;
+    int output_len, data_len, dst_len;
+    long level = 0;
+    long maxLevel = (long)PHP_LZ4_CLEVEL_MAX;
+    char *extra = NULL;
+#if ZEND_MODULE_API_NO >= 20141001
+    size_t extra_len = -1;
+#else
+    int extra_len = -1;
+#endif
+    int offset = 0;
+
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC,
+                              "zz|ls", &path, &data, &level,
+                              &extra, &extra_len) == FAILURE) {
+        RETURN_FALSE;
+    }
+
+    if (Z_TYPE_P(path) != IS_STRING || Z_TYPE_P(data) != IS_STRING) {
+        zend_error(E_WARNING,
+                   "lz4_compress_to_file : expects parameter to be string.");
+        RETURN_FALSE;
+    }
+
+    stream = php_stream_open_wrapper(Z_STRVAL_P(path), "wb", REPORT_ERRORS, NULL);
+    if (!stream) {
+        zend_error(E_WARNING, "lz4_compress_to_file : enable to open stream for writing");
+        RETURN_FALSE;
+    }
+
+    if (extra && extra_len > 0) {
+        offset = extra_len;
+    } else {
+        offset = sizeof(int);
+    }
+
+    data_len = Z_STRLEN_P(data);
+    dst_len = LZ4_compressBound(data_len) + offset;
+
+    output = (char *)emalloc(dst_len);
+    if (!output) {
+        zend_error(E_WARNING, "lz4_compress_to_file : memory error");
+        php_stream_close(stream);
+        RETURN_FALSE;
+    }
+
+    if (extra && extra_len > 0) {
+        memcpy(output, extra, offset);
+    } else {
+        /* Set the data length */
+        memcpy(output, &data_len, offset);
+    }
+
+    if (level == 0) {
+        output_len = LZ4_compress_default(Z_STRVAL_P(data), output + offset, data_len, dst_len - offset - 1);
+    } else {
+        if (level > maxLevel || level < 0) {
+            zend_error(E_WARNING, "lz4_compress_to_file : compression level (%ld)"
+                       " must be within 1..%ld", level, maxLevel);
+            efree(output);
+            php_stream_close(stream);
+            RETURN_FALSE;
+        }
+        output_len = LZ4_compress_HC(Z_STRVAL_P(data), output + offset, data_len, dst_len - offset - 1, level);
+    }
+
+    if (output_len <= 0) {
+        RETVAL_FALSE;
+    } else {
+        output_len += offset;
+        if (php_stream_write(stream, output, output_len) != output_len) {
+            zend_error(E_WARNING, "lz4_compress_to_file : file not properly written");
+            RETVAL_FALSE;
+        } else {
+            RETVAL_TRUE;
+        }
+    }
+
+    php_stream_close(stream);
+    efree(output);
+}
+
 static ZEND_FUNCTION(lz4_uncompress)
 {
     zval *data;
@@ -267,6 +372,87 @@ static ZEND_FUNCTION(lz4_uncompress)
 
     if (output_len <= 0) {
         zend_error(E_WARNING, "lz4_uncompress : data error");
+        RETVAL_FALSE;
+    } else {
+#if ZEND_MODULE_API_NO >= 20141001
+        RETVAL_STRINGL(output, output_len);
+#else
+        RETVAL_STRINGL(output, output_len, 1);
+#endif
+    }
+
+    free(output);
+}
+
+static ZEND_FUNCTION(lz4_uncompress_from_file)
+{
+    zval *path;
+    zend_string *data;
+    char *dat;
+    php_stream *stream;
+    int output_len, data_size;
+    char *output;
+#if ZEND_MODULE_API_NO >= 20141001
+    zend_long max_size = -1, offset = 0;
+#else
+    long max_size = -1, offset = 0;
+#endif
+
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC,
+                              "z|ll", &path, &max_size, &offset) == FAILURE) {
+        RETURN_FALSE;
+    }
+
+    if (Z_TYPE_P(path) != IS_STRING) {
+        zend_error(E_WARNING,
+                   "lz4_uncompress_from_file : expects parameter to be string.");
+        RETURN_FALSE;
+    }
+
+    stream = php_stream_open_wrapper(Z_STRVAL_P(path), "rb", REPORT_ERRORS, NULL);
+    if (!stream) {
+        zend_error(E_WARNING, "lz4_uncompress_from_file : unable to open stream for reading");
+        RETURN_FALSE;
+    }
+
+    data = php_stream_copy_to_mem(stream, PHP_STREAM_COPY_ALL, 0);
+    if (!data) {
+        zend_error(E_WARNING, "lz4_uncompress_from_file : unable to read data from stream");
+        php_stream_close(stream);
+        RETURN_FALSE;
+    }
+
+    php_stream_close(stream);
+
+    if (max_size > 0) {
+        data_size = max_size;
+        if (!offset) {
+            offset = sizeof(int);
+        }
+    } else {
+        /* Get data length */
+        offset = sizeof(int);
+        memcpy(&data_size, ZSTR_VAL(data), offset);
+    }
+
+    if (data_size < 0) {
+        zend_error(E_WARNING, "lz4_uncompress_from_file : allocate size error");
+        RETURN_FALSE;
+    }
+
+    output = (char *)malloc(data_size + 1);
+    if (!output) {
+        zend_error(E_WARNING, "lz4_uncompress_from_file : memory error");
+        RETURN_FALSE;
+    }
+
+    output_len = LZ4_decompress_safe(ZSTR_VAL(data) + offset,
+                                     output,
+                                     ZSTR_LEN(data) - offset,
+                                     data_size);
+
+    if (output_len <= 0) {
+        zend_error(E_WARNING, "lz4_uncompress_from_file : data error");
         RETVAL_FALSE;
     } else {
 #if ZEND_MODULE_API_NO >= 20141001

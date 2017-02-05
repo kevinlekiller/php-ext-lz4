@@ -1,3 +1,21 @@
+# Fork information
+
+Adds a compress function to compress data to lz4 and write to file, decompress function to read lz4 data from file and decompress.
+
+string **lz4\_compress_to_file** ( string _$path_, string _$data_ [ , int _$level_ = 0 , string _$extra_ = NULL ] )
+
+* _path_
+
+  File path to write lz4 data to.
+
+string **lz4\_uncompress_from_file** ( string _$path_, string _$data_ [ , long _$maxsize_ = -1 , long _$offset_ = -1 ] )
+
+* _path_
+
+  File path to read lz4 data from and decompress.
+
+Original README follows:
+
 # LZ4 Extension for PHP
 
 [![Build Status](https://secure.travis-ci.org/kjdev/php-ext-lz4.png?branch=master)](http://travis-ci.org/kjdev/php-ext-lz4)
